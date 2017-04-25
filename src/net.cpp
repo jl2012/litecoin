@@ -62,7 +62,7 @@
 
 
 namespace {
-    const int MAX_OUTBOUND_CONNECTIONS = 8;
+    const int MAX_OUTBOUND_CONNECTIONS = 24;
     const int MAX_FEELER_CONNECTIONS = 1;
 
     struct ListenSocket {
@@ -447,6 +447,7 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure
 
         pnode->nServicesExpected = ServiceFlags(addrConnect.nServices & nRelevantServices);
         pnode->nTimeConnected = GetTime();
+        pnode->fWhitelisted = CNode::IsWhitelistedRange((CNetAddr)pnode->addr);
 
         return pnode;
     } else if (!proxyConnectionFailed) {
