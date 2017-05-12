@@ -109,7 +109,7 @@ UniValue getnewaddress(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() > 1)
+    if (request.fHelp || request.params.size() > 2)
         throw runtime_error(
             "getnewaddress ( \"account\" )\n"
             "\nReturns a new Litecoin address for receiving payments.\n"
@@ -117,6 +117,7 @@ UniValue getnewaddress(const JSONRPCRequest& request)
             "so payments received with the address will be credited to 'account'.\n"
             "\nArguments:\n"
             "1. \"account\"        (string, optional) DEPRECATED. The account name for the address to be linked to. If not provided, the default account \"\" is used. It can also be set to the empty string \"\" to represent the default account. The account does not need to exist, it will be created if there is no account by the given name.\n"
+            "2. \"witness\"        (bool, optional, default=true) Return a witness address\n"
             "\nResult:\n"
             "\"address\"    (string) The new litecoin address\n"
             "\nExamples:\n"
@@ -139,6 +140,23 @@ UniValue getnewaddress(const JSONRPCRequest& request)
     if (!pwalletMain->GetKeyFromPool(newKey))
         throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, "Error: Keypool ran out, please call keypoolrefill first");
     CKeyID keyID = newKey.GetID();
+
+    // Generate a witness address if segwit is activated
+    bool fRequireWitness = true;
+    if (request.params.size() > 1) {
+        fRequireWitness = request.params[1].get_bool();
+    }
+    {
+        LOCK(cs_main);
+        fRequireWitness &= (IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()) && !GetBoolArg("-walletprematurewitness", false));
+    }
+    if (fRequireWitness) {
+        CScript basescript = GetScriptForDestination(keyID);
+        CScript witscript = GetScriptForWitness(basescript);
+        pwalletMain->AddCScript(witscript);
+        pwalletMain->SetAddressBook(CScriptID(witscript), strAccount, "receive");
+        return CBitcoinAddress(CScriptID(witscript)).ToString();
+    }
 
     pwalletMain->SetAddressBook(keyID, strAccount, "receive");
 
@@ -198,6 +216,8 @@ UniValue getrawchangeaddress(const JSONRPCRequest& request)
             "getrawchangeaddress\n"
             "\nReturns a new Litecoin address, for receiving change.\n"
             "This is for use with raw transactions, NOT normal use.\n"
+            "\nArguments:\n"
+            "1. \"witness\"        (bool, optional, default=true) Return a witness address\n"
             "\nResult:\n"
             "\"address\"    (string) The address\n"
             "\nExamples:\n"
@@ -218,6 +238,22 @@ UniValue getrawchangeaddress(const JSONRPCRequest& request)
     reservekey.KeepKey();
 
     CKeyID keyID = vchPubKey.GetID();
+
+    // Generate a witness address if segwit is activated
+    bool fRequireWitness = true;
+    if (request.params.size() > 0) {
+        fRequireWitness = request.params[0].get_bool();
+    }
+    {
+        LOCK(cs_main);
+        fRequireWitness &= (IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()) && !GetBoolArg("-walletprematurewitness", false));
+    }
+    if (fRequireWitness) {
+        CScript basescript = GetScriptForDestination(keyID);
+        CScript witscript = GetScriptForWitness(basescript);
+        pwalletMain->AddCScript(witscript);
+        return CBitcoinAddress(CScriptID(witscript)).ToString();
+    }
 
     return CBitcoinAddress(keyID).ToString();
 }
@@ -338,7 +374,7 @@ UniValue getaddressesbyaccount(const JSONRPCRequest& request)
     return ret;
 }
 
-static void SendMoney(const CTxDestination &address, CAmount nValue, bool fSubtractFeeFromAmount, CWalletTx& wtxNew)
+static void SendMoney(const CTxDestination &address, CAmount nValue, bool fSubtractFeeFromAmount, CWalletTx& wtxNew, const bool& fChangeWitness)
 {
     CAmount curBalance = pwalletMain->GetBalance();
 
@@ -363,7 +399,7 @@ static void SendMoney(const CTxDestination &address, CAmount nValue, bool fSubtr
     int nChangePosRet = -1;
     CRecipient recipient = {scriptPubKey, nValue, fSubtractFeeFromAmount};
     vecSend.push_back(recipient);
-    if (!pwalletMain->CreateTransaction(vecSend, wtxNew, reservekey, nFeeRequired, nChangePosRet, strError)) {
+    if (!pwalletMain->CreateTransaction(vecSend, wtxNew, reservekey, nFeeRequired, nChangePosRet, strError, fChangeWitness)) {
         if (!fSubtractFeeFromAmount && nValue + nFeeRequired > curBalance)
             strError = strprintf("Error: This transaction requires a transaction fee of at least %s", FormatMoney(nFeeRequired));
         throw JSONRPCError(RPC_WALLET_ERROR, strError);
@@ -380,7 +416,7 @@ UniValue sendtoaddress(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 5)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 6)
         throw runtime_error(
             "sendtoaddress \"address\" amount ( \"comment\" \"comment_to\" subtractfeefromamount )\n"
             "\nSend an amount to a given address.\n"
@@ -395,6 +431,7 @@ UniValue sendtoaddress(const JSONRPCRequest& request)
             "                             transaction, just kept in your wallet.\n"
             "5. subtractfeefromamount  (boolean, optional, default=false) The fee will be deducted from the amount being sent.\n"
             "                             The recipient will receive less litecoins than you enter in the amount field.\n"
+            "6. \"changewitness\"      (bool, optional, default=true) Send change to a witness address\n"
             "\nResult:\n"
             "\"txid\"                  (string) The transaction id.\n"
             "\nExamples:\n"
@@ -428,7 +465,17 @@ UniValue sendtoaddress(const JSONRPCRequest& request)
 
     EnsureWalletIsUnlocked();
 
-    SendMoney(address.Get(), nAmount, fSubtractFeeFromAmount, wtx);
+    // Send change to a witness address if segwit is activated
+    bool fChangeWitness = true;
+    if (request.params.size() > 5) {
+        fChangeWitness = request.params[5].get_bool();
+    }
+    {
+        LOCK(cs_main);
+        fChangeWitness &= IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()) && !GetBoolArg("-walletprematurewitness", false);
+    }
+
+    SendMoney(address.Get(), nAmount, fSubtractFeeFromAmount, wtx, fChangeWitness);
 
     return wtx.GetHash().GetHex();
 }
@@ -812,7 +859,7 @@ UniValue sendfrom(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 3 || request.params.size() > 6)
+    if (request.fHelp || request.params.size() < 3 || request.params.size() > 7)
         throw runtime_error(
             "sendfrom \"fromaccount\" \"toaddress\" amount ( minconf \"comment\" \"comment_to\" )\n"
             "\nDEPRECATED (use sendtoaddress). Sent an amount from an account to a litecoin address."
@@ -830,6 +877,7 @@ UniValue sendfrom(const JSONRPCRequest& request)
             "6. \"comment_to\"        (string, optional) An optional comment to store the name of the person or organization \n"
             "                                     to which you're sending the transaction. This is not part of the transaction, \n"
             "                                     it is just kept in your wallet.\n"
+            "7. \"changewitness\"     (bool, optional, default=true) Send change to a witness address\n"
             "\nResult:\n"
             "\"txid\"                 (string) The transaction id.\n"
             "\nExamples:\n"
@@ -868,7 +916,17 @@ UniValue sendfrom(const JSONRPCRequest& request)
     if (nAmount > nBalance)
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Account has insufficient funds");
 
-    SendMoney(address.Get(), nAmount, false, wtx);
+    // Send change to a witness address if segwit is activated
+    bool fChangeWitness = true;
+    if (request.params.size() > 6) {
+        fChangeWitness = request.params[6].get_bool();
+    }
+    {
+        LOCK(cs_main);
+        fChangeWitness &= IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()) && !GetBoolArg("-walletprematurewitness", false);
+    }
+
+    SendMoney(address.Get(), nAmount, false, wtx, fChangeWitness);
 
     return wtx.GetHash().GetHex();
 }
@@ -901,6 +959,7 @@ UniValue sendmany(const JSONRPCRequest& request)
             "      \"address\"          (string) Subtract fee from this address\n"
             "      ,...\n"
             "    ]\n"
+            "6. \"changewitness\"     (bool, optional, default=true) Send change to a witness address\n"
             "\nResult:\n"
             "\"txid\"                   (string) The transaction id for the send. Only 1 transaction is created regardless of \n"
             "                                    the number of addresses.\n"
@@ -974,12 +1033,22 @@ UniValue sendmany(const JSONRPCRequest& request)
     if (totalAmount > nBalance)
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Account has insufficient funds");
 
+    // Send change to a witness address if segwit is activated
+    bool fChangeWitness = true;
+    if (request.params.size() > 5) {
+        fChangeWitness = request.params[5].get_bool();
+    }
+    {
+        LOCK(cs_main);
+        fChangeWitness &= IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()) && !GetBoolArg("-walletprematurewitness", false);
+    }
+
     // Send
     CReserveKey keyChange(pwalletMain);
     CAmount nFeeRequired = 0;
     int nChangePosRet = -1;
     string strFailReason;
-    bool fCreated = pwalletMain->CreateTransaction(vecSend, wtx, keyChange, nFeeRequired, nChangePosRet, strFailReason);
+    bool fCreated = pwalletMain->CreateTransaction(vecSend, wtx, keyChange, nFeeRequired, nChangePosRet, strFailReason, fChangeWitness);
     if (!fCreated)
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, strFailReason);
     CValidationState state;
@@ -999,7 +1068,7 @@ UniValue addmultisigaddress(const JSONRPCRequest& request)
     if (!EnsureWalletIsAvailable(request.fHelp))
         return NullUniValue;
 
-    if (request.fHelp || request.params.size() < 2 || request.params.size() > 3)
+    if (request.fHelp || request.params.size() < 2 || request.params.size() > 4)
     {
         string msg = "addmultisigaddress nrequired [\"key\",...] ( \"account\" )\n"
             "\nAdd a nrequired-to-sign multisignature address to the wallet.\n"
@@ -1014,6 +1083,7 @@ UniValue addmultisigaddress(const JSONRPCRequest& request)
             "       ...,\n"
             "     ]\n"
             "3. \"account\"      (string, optional) DEPRECATED. An account to assign the addresses to.\n"
+            "4. \"witness\"      (bool, optional, default=true) Return a witness address\n"
 
             "\nResult:\n"
             "\"address\"         (string) A litecoin address associated with the keys.\n"
@@ -1033,10 +1103,24 @@ UniValue addmultisigaddress(const JSONRPCRequest& request)
     if (request.params.size() > 2)
         strAccount = AccountFromValue(request.params[2]);
 
+    // Generate a witness address if segwit is activated
+    bool fRequireWitness = true;
+    if (request.params.size() > 3) {
+        fRequireWitness = request.params[3].get_bool();
+    }
+    {
+        LOCK(cs_main);
+        fRequireWitness &= (IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()) && !GetBoolArg("-walletprematurewitness", false));
+    }
+
     // Construct using pay-to-script-hash:
     CScript inner = _createmultisig_redeemScript(request.params);
-    CScriptID innerID(inner);
     pwalletMain->AddCScript(inner);
+    if (fRequireWitness) {
+        inner = GetScriptForWitness(inner);
+        pwalletMain->AddCScript(inner);
+    }
+    CScriptID innerID(inner);
 
     pwalletMain->SetAddressBook(innerID, strAccount, "send");
     return CBitcoinAddress(innerID).ToString();
@@ -3011,7 +3095,7 @@ static const CRPCCommand commands[] =
     { "wallet",             "getaccount",               &getaccount,               true,   {"address"} },
     { "wallet",             "getaddressesbyaccount",    &getaddressesbyaccount,    true,   {"account"} },
     { "wallet",             "getbalance",               &getbalance,               false,  {"account","minconf","include_watchonly"} },
-    { "wallet",             "getnewaddress",            &getnewaddress,            true,   {"account"} },
+    { "wallet",             "getnewaddress",            &getnewaddress,            true,   {"account","witness"} },
     { "wallet",             "getrawchangeaddress",      &getrawchangeaddress,      true,   {} },
     { "wallet",             "getreceivedbyaccount",     &getreceivedbyaccount,     false,  {"account","minconf"} },
     { "wallet",             "getreceivedbyaddress",     &getreceivedbyaddress,     false,  {"address","minconf"} },

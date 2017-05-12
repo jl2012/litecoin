@@ -2337,7 +2337,7 @@ bool CWallet::FundTransaction(CMutableTransaction& tx, CAmount& nFeeRet, bool ov
 
     CReserveKey reservekey(this);
     CWalletTx wtx;
-    if (!CreateTransaction(vecSend, wtx, reservekey, nFeeRet, nChangePosInOut, strFailReason, &coinControl, false))
+    if (!CreateTransaction(vecSend, wtx, reservekey, nFeeRet, nChangePosInOut, strFailReason, false, &coinControl, false))
         return false;
 
     if (nChangePosInOut != -1)
@@ -2370,11 +2370,13 @@ bool CWallet::FundTransaction(CMutableTransaction& tx, CAmount& nFeeRet, bool ov
 }
 
 bool CWallet::CreateTransaction(const vector<CRecipient>& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, CAmount& nFeeRet,
-                                int& nChangePosInOut, std::string& strFailReason, const CCoinControl* coinControl, bool sign)
+                                int& nChangePosInOut, std::string& strFailReason, const bool& fChangeWitness, const CCoinControl* coinControl, bool sign)
 {
     CAmount nValue = 0;
     int nChangePosRequest = nChangePosInOut;
     unsigned int nSubtractFeeFromAmount = 0;
+    int nP2SH = 0;
+    int nBareWitness = 0;
     for (const auto& recipient : vecSend)
     {
         if (nValue < 0 || recipient.nAmount < 0)
@@ -2386,6 +2388,14 @@ bool CWallet::CreateTransaction(const vector<CRecipient>& vecSend, CWalletTx& wt
 
         if (recipient.fSubtractFeeFromAmount)
             nSubtractFeeFromAmount++;
+
+        txnouttype whichType;
+        std::vector<std::vector<unsigned char> > vSolutions;
+        Solver(recipient.scriptPubKey, whichType, vSolutions);
+        if (whichType == TX_SCRIPTHASH)
+            nP2SH++;
+        else if (whichType == TX_WITNESS_V0_KEYHASH || whichType == TX_WITNESS_V0_SCRIPTHASH)
+            nBareWitness++;
     }
     if (vecSend.empty())
     {
@@ -2537,6 +2547,17 @@ bool CWallet::CreateTransaction(const vector<CRecipient>& vecSend, CWalletTx& wt
                         }
 
                         scriptChange = GetScriptForDestination(vchPubKey.GetID());
+                        // Randomly use witness change address based on the number of P2SH and bare witness outputs
+                        // Change might be sent to non-witness address even when all outputs are P2SH or bare witness.
+                        if (fChangeWitness && (nP2SH + nBareWitness)) {
+                            int nRand = GetRandInt(vecSend.size() + 1);
+                            if (nRand < (nP2SH + nBareWitness)) {
+                                scriptChange = GetScriptForWitness(scriptChange);
+                                AddCScript(scriptChange);
+                                if (nBareWitness == 0)
+                                    scriptChange = GetScriptForDestination(scriptChange);
+                            }
+                        }
                     }
 
                     CTxOut newTxOut(nChange, scriptChange);
