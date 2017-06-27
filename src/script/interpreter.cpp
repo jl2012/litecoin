@@ -274,6 +274,7 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
         return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
     bool fIsLegacy = (sigversion == SIGVERSION_BASE || sigversion == SIGVERSION_WITNESS_V0);
     bool fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA) != 0;
+    size_t sizeCScriptNum = (fIsLegacy ? 4 : 7);
 
     try
     {
@@ -767,7 +768,7 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                     // (in -- out)
                     if (stack.size() < 1)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    CScriptNum bn(stacktop(-1), fRequireMinimal);
+                    CScriptNum bn(stacktop(-1), fRequireMinimal, sizeCScriptNum);
                     switch (opcode)
                     {
                     case OP_1ADD:       bn += bnOne; break;
@@ -780,6 +781,8 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                     }
                     popstack(stack);
                     stack.push_back(bn.getvch());
+                    if (stacktop(-1).size() > sizeCScriptNum && !fIsLegacy)
+                        return set_error(serror, SCRIPT_ERR_NUM_PUSH_SIZE);
                 }
                 break;
 
@@ -800,8 +803,8 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                     // (x1 x2 -- out)
                     if (stack.size() < 2)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    CScriptNum bn1(stacktop(-2), fRequireMinimal);
-                    CScriptNum bn2(stacktop(-1), fRequireMinimal);
+                    CScriptNum bn1(stacktop(-2), fRequireMinimal, sizeCScriptNum);
+                    CScriptNum bn2(stacktop(-1), fRequireMinimal, sizeCScriptNum);
                     CScriptNum bn(0);
                     switch (opcode)
                     {
@@ -830,6 +833,8 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                     popstack(stack);
                     stack.push_back(bn.getvch());
 
+                    if (stacktop(-1).size() > sizeCScriptNum && !fIsLegacy)
+                        return set_error(serror, SCRIPT_ERR_NUM_PUSH_SIZE);
                     if (opcode == OP_NUMEQUALVERIFY)
                     {
                         if (CastToBool(stacktop(-1)))
@@ -845,9 +850,9 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                     // (x min max -- out)
                     if (stack.size() < 3)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    CScriptNum bn1(stacktop(-3), fRequireMinimal);
-                    CScriptNum bn2(stacktop(-2), fRequireMinimal);
-                    CScriptNum bn3(stacktop(-1), fRequireMinimal);
+                    CScriptNum bn1(stacktop(-3), fRequireMinimal, sizeCScriptNum);
+                    CScriptNum bn2(stacktop(-2), fRequireMinimal, sizeCScriptNum);
+                    CScriptNum bn3(stacktop(-1), fRequireMinimal, sizeCScriptNum);
                     bool fValue = (bn2 <= bn1 && bn1 < bn3);
                     popstack(stack);
                     popstack(stack);
