@@ -197,13 +197,13 @@ class SegWitTest(BitcoinTestFramework):
 
     def setup_network(self):
         self.nodes = []
-        self.nodes.append(start_node(0, self.options.tmpdir, ["-debug", "-logtimemicros=1", "-whitelist=127.0.0.1"]))
+        self.nodes.append(start_node(0, self.options.tmpdir, ["-debug", "-logtimemicros=1", "-whitelist=127.0.0.1", "-bip9params=msv0:0:0"]))
         # Start a node for testing IsStandard rules.
-        self.nodes.append(start_node(1, self.options.tmpdir, ["-debug", "-logtimemicros=1", "-whitelist=127.0.0.1", "-acceptnonstdtxn=0"]))
+        self.nodes.append(start_node(1, self.options.tmpdir, ["-debug", "-logtimemicros=1", "-whitelist=127.0.0.1", "-acceptnonstdtxn=0", "-bip9params=msv0:0:0"]))
         connect_nodes(self.nodes[0], 1)
 
         # Disable segwit's bip9 parameter to simulate upgrading after activation.
-        self.nodes.append(start_node(2, self.options.tmpdir, ["-debug", "-whitelist=127.0.0.1", "-bip9params=segwit:0:0"]))
+        self.nodes.append(start_node(2, self.options.tmpdir, ["-debug", "-whitelist=127.0.0.1", "-bip9params=segwit:0:0", "-bip9params=msv0:0:0"]))
         connect_nodes(self.nodes[0], 2)
 
     ''' Helpers '''
