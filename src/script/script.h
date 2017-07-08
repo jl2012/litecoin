@@ -621,8 +621,12 @@ public:
      * CHECKMULTISIGs serialized in scriptSigs are
      * counted more accurately, assuming they are of the form
      *  ... OP_N CHECKMULTISIG ...
+     *
+     * In MSV0, it counts the number of signatures, assuming they are of the form
+     *  ... OP_M key1 key2 ... keyN OP_N CHECKMULTISIG ...
+     * Otherwise, it counts number of keys like P2SH
      */
-    unsigned int GetSigOpCount(bool fAccurate) const;
+    unsigned int GetSigOpCount(bool fAccurate, bool fMSV0 = false) const;
 
     /**
      * Accurately count sigOps, including sigOps in

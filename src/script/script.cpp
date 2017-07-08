@@ -157,10 +157,11 @@ const char* GetOpName(opcodetype opcode)
     }
 }
 
-unsigned int CScript::GetSigOpCount(bool fAccurate) const
+unsigned int CScript::GetSigOpCount(bool fAccurate, bool fMSV0) const
 {
     unsigned int n = 0;
     const_iterator pc = begin();
+    vector<opcodetype> vopcodePushType;
     opcodetype lastOpcode = OP_INVALIDOPCODE;
     while (pc < end())
     {
@@ -169,14 +170,37 @@ unsigned int CScript::GetSigOpCount(bool fAccurate) const
             break;
         if (opcode == OP_CHECKSIG || opcode == OP_CHECKSIGVERIFY)
             n++;
-        else if (opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY)
-        {
-            if (fAccurate && lastOpcode >= OP_1 && lastOpcode <= OP_16)
-                n += DecodeOP_N(lastOpcode);
-            else
-                n += MAX_PUBKEYS_PER_MULTISIG;
+        else if (opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY) {
+            if (fMSV0) {
+                if (!vopcodePushType.empty() && vopcodePushType.back() >= OP_1 && vopcodePushType.back() <= OP_16) {
+                    uint32_t nKey = DecodeOP_N(vopcodePushType.back());
+                    n += nKey;
+                    if (vopcodePushType.size() >= nKey + 2) {
+                        const opcodetype& opcodeSigCount = vopcodePushType.at(vopcodePushType.size() - nKey - 2);
+                        if (opcodeSigCount >= OP_1 && opcodeSigCount <= OP_16) {
+                            const uint32_t nSig = DecodeOP_N(opcodeSigCount);
+                            if (nSig < nKey)
+                                n = n - nKey + nSig;
+                        }
+                    }
+                }
+                else
+                    n += MAX_PUBKEYS_PER_MULTISIG;
+            }
+            else {
+                if (fAccurate && lastOpcode >= OP_1 && lastOpcode <= OP_16)
+                    n += DecodeOP_N(lastOpcode);
+                else
+                    n += MAX_PUBKEYS_PER_MULTISIG;
+            }
         }
+        else if ((opcode == OP_CHECKSIGFROMSTACK || opcode == OP_CHECKSIGFROMSTACKVERIFY) && fMSV0)
+            n++;
         lastOpcode = opcode;
+        if (opcode <= OP_16)
+            vopcodePushType.push_back(opcode);
+        else
+            vopcodePushType.clear();
     }
     return n;
 }
