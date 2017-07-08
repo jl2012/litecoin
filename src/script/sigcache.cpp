@@ -101,13 +101,13 @@ void InitSignatureCache()
             (nElems*sizeof(uint256)) >>20, nMaxCacheSize>>20, nElems);
 }
 
-bool CachingTransactionSignatureChecker::VerifySignature(const std::vector<unsigned char>& vchSig, const CPubKey& pubkey, const uint256& sighash) const
+bool CachingTransactionSignatureChecker::VerifySignature(const std::vector<unsigned char>& vchSig, const CPubKey& pubkey, const uint256& sighash, const bool& compact) const
 {
     uint256 entry;
     signatureCache.ComputeEntry(entry, sighash, vchSig, pubkey);
     if (signatureCache.Get(entry, !store))
         return true;
-    if (!TransactionSignatureChecker::VerifySignature(vchSig, pubkey, sighash))
+    if (!TransactionSignatureChecker::VerifySignature(vchSig, pubkey, sighash, compact))
         return false;
     if (store)
         signatureCache.Set(entry);

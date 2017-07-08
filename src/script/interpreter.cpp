@@ -178,7 +178,7 @@ bool static IsLowDERSignature(const valtype &vchSig, ScriptError* serror) {
         return set_error(serror, SCRIPT_ERR_SIG_DER);
     }
     std::vector<unsigned char> vchSigCopy(vchSig.begin(), vchSig.begin() + vchSig.size() - 1);
-    if (!CPubKey::CheckLowS(vchSigCopy)) {
+    if (!CPubKey::CheckLowS(vchSigCopy, false)) {
         return set_error(serror, SCRIPT_ERR_SIG_HIGH_S);
     }
     return true;
@@ -195,10 +195,34 @@ bool static IsDefinedHashtypeSignature(const valtype &vchSig) {
     return true;
 }
 
-bool CheckSignatureEncoding(const vector<unsigned char> &vchSig, unsigned int flags, ScriptError* serror) {
+uint32_t GetCompactHashType(const vector<unsigned char> &vchSig) {
+    uint32_t nHashType = 0;
+    assert(vchSig.size() < 69);
+    for (size_t i = 64; i < vchSig.size(); i++)
+        nHashType |= static_cast<uint32_t>(vchSig[i]) << (8 * (i - 64));
+    return nHashType;
+}
+
+bool CheckSignatureEncoding(const vector<unsigned char> &vchSig, unsigned int flags, const SigVersion &sigversion, ScriptError* serror) {
     // Empty signature. Not strictly DER encoded, but allowed to provide a
     // compact way to provide an invalid signature for use with CHECK(MULTI)SIG
     if (vchSig.size() == 0) {
+        return true;
+    }
+    if (sigversion != SIGVERSION_BASE && sigversion != SIGVERSION_WITNESS_V0) {
+        if (vchSig.size() < 64 || vchSig.size() > 66)
+            return set_error(serror, SCRIPT_ERR_SIG_COMPACT);
+
+        if (vchSig.size() >= 65 && vchSig.back() == 0)
+            return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
+
+        const uint32_t nHashType = GetCompactHashType(vchSig);
+        if ((nHashType & 0xc) == 8)
+            return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
+
+        const std::vector<unsigned char> vchSigCopy(vchSig.begin(), vchSig.begin() + 64);
+        if (!CPubKey::CheckLowS(vchSigCopy, true))
+            return set_error(serror, SCRIPT_ERR_SIG_HIGH_S);
         return true;
     }
     if ((flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) != 0 && !IsValidSignatureEncoding(vchSig)) {
@@ -213,6 +237,9 @@ bool CheckSignatureEncoding(const vector<unsigned char> &vchSig, unsigned int fl
 }
 
 bool static CheckPubKeyEncoding(const valtype &vchPubKey, unsigned int flags, const SigVersion &sigversion, ScriptError* serror) {
+    if (sigversion == SIGVERSION_MSV0 && !IsCompressedPubKey(vchPubKey)) {
+        return set_error(serror, SCRIPT_ERR_WITNESS_PUBKEYTYPE);
+    }
     if ((flags & SCRIPT_VERIFY_STRICTENC) != 0 && !IsCompressedOrUncompressedPubKey(vchPubKey)) {
         return set_error(serror, SCRIPT_ERR_PUBKEYTYPE);
     }
@@ -249,10 +276,12 @@ bool static CheckMinimalPush(const valtype& data, opcodetype opcode) {
 bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror)
 {
     int nOpCount = 0;
-    return EvalScript(stack, script, flags, checker, sigversion, nOpCount, serror);
+    std::vector<CScript> vscriptSigCode;
+    unsigned int fUncoveredScriptSigCode = 0;
+    return EvalScript(stack, script, flags, checker, sigversion, nOpCount, vscriptSigCode, 0, fUncoveredScriptSigCode, serror);
 }
 
-bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, int& nOpCount, ScriptError* serror)
+bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, int& nOpCount, const std::vector<CScript>& vscriptSigCode, const size_t& posSigScriptCode, unsigned int& fUncoveredScriptSigCode, ScriptError* serror)
 {
     static const CScriptNum bnZero(0);
     static const CScriptNum bnOne(1);
@@ -1246,11 +1275,50 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                         scriptCode.FindAndDelete(CScript(vchSig));
                     }
 
-                    if (!CheckSignatureEncoding(vchSig, flags, serror) || !CheckPubKeyEncoding(vchPubKey, flags, sigversion, serror)) {
+                    if (!CheckSignatureEncoding(vchSig, flags, sigversion, serror) || !CheckPubKeyEncoding(vchPubKey, flags, sigversion, serror)) {
                         //serror is set
                         return false;
                     }
-                    bool fSuccess = checker.CheckSig(vchSig, vchPubKey, scriptCode, sigversion);
+                    bool fSuccess = checker.CheckSig(vchSig, vchPubKey, scriptCode, sigversion, vscriptSigCode);
+
+                    if (sigversion == SIGVERSION_MSV0) {
+                        /*
+                         * The following logic is needed only if some bits are set in fUncoveredScriptSigCode,
+                         * suggesting some non-empty scriptSigCode were not covered by any signature operations.
+                         *
+                         * In MSV0, the SIGHASH_MSV0_NOSCRIPTSIGCODEs start from bit 11 of nHashType.
+                         * By right-shifting nHashType by 11 bits, it shows which scriptSigCode are NOT covered.
+                         *
+                         * Only a signature operation in a later scriptSigCode may cover an earlier scriptSigCode.
+                         * Signature operations in scriptKeyCode may cover any scriptSigCode. 0 bits in the mask
+                         * indicate which scriptSigCode might be covered. For example, mask for the different
+                         * scriptSigCode and the scriptKeyCode are as follow:
+                         * vscriptSigCode[4]    11111 ..... 111111    (No scriptSigCode covered)
+                         * vscriptSigCode[3]    11111 ..... 111110
+                         * vscriptSigCode[2]    11111 ..... 111100
+                         * vscriptSigCode[1]    11111 ..... 111000
+                         * vscriptSigCode[0]    11111 ..... 110000
+                         * scriptKeyCode        11111 ..... 100000    (May cover all scriptSigCode)
+                         *
+                         * A scriptSigCode is legitimately covered if and only if both uncovered and mask are 0,
+                         * i.e. 0 bits of (uncovered | mask)
+                         *
+                         * Finally, we find which scriptSigCode are not yet legitimately covered by any signature
+                         * operation with (fUncoveredScriptSigCode & uncovered)
+                         *
+                         * At the end of scriptKeyCode evaluation, fUncoveredScriptSigCode must be 0 or the evaluation
+                         * will fail. This ensures that all scriptSigCode are directly or indirectly covered by the
+                         * scriptKeyCode, and not third-party malleable.
+                         */
+                        if (fSuccess & fUncoveredScriptSigCode) {
+                            uint32_t uncovered = GetCompactHashType(vchSig) >> 11;
+                            const uint32_t mask = ~((1U << posSigScriptCode) - 1);
+                            uncovered |= mask;
+                            fUncoveredScriptSigCode &= uncovered;
+                        }
+                        else if (!fSuccess && vchSig.size())
+                            return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);
+                    }
 
                     if (!fSuccess && (flags & SCRIPT_VERIFY_NULLFAIL) && vchSig.size())
                         return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);
@@ -1320,13 +1388,13 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                         // Note how this makes the exact order of pubkey/signature evaluation
                         // distinguishable by CHECKMULTISIG NOT if the STRICTENC flag is set.
                         // See the script_(in)valid tests for details.
-                        if (!CheckSignatureEncoding(vchSig, flags, serror) || !CheckPubKeyEncoding(vchPubKey, flags, sigversion, serror)) {
+                        if (!CheckSignatureEncoding(vchSig, flags, sigversion, serror) || !CheckPubKeyEncoding(vchPubKey, flags, sigversion, serror)) {
                             // serror is set
                             return false;
                         }
 
                         // Check signature
-                        bool fOk = checker.CheckSig(vchSig, vchPubKey, scriptCode, sigversion);
+                        bool fOk = checker.CheckSig(vchSig, vchPubKey, scriptCode, sigversion, vscriptSigCode);
 
                         if (fOk) {
                             isig++;
@@ -1526,8 +1594,67 @@ PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo)
     hashOutputs = GetOutputsHash(txTo);
 }
 
-uint256 SignatureHash(const CScript& scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType, const CAmount& amount, const CAmount& nFees, SigVersion sigversion, const PrecomputedTransactionData* cache)
+uint256 SignatureHash(const CScript& scriptCode, std::vector<CScript> vscriptSigCode, const CTransaction& txTo, unsigned int nIn, unsigned int nHashType, const CAmount& amount, const CAmount& nFeesIn, SigVersion sigversion, const PrecomputedTransactionData* cache)
 {
+    if (sigversion == SIGVERSION_MSV0) {
+        int nVersion = (nHashType & SIGHASH_MSV0_NOVERSION) ? -1 : txTo.nVersion;
+        unsigned int nInputIndex = (nHashType & SIGHASH_MSV0_NOINPUTINDEX) ? 0xffffffff : nIn;
+
+        uint256 hashPrevouts;
+        COutPoint prevoutSingle;
+        if (!(nHashType & 3))
+            hashPrevouts = cache ? cache->hashPrevouts : GetPrevoutHash(txTo);
+        else if ((nHashType & 3) == SIGHASH_MSV0_SINGLEINPUT)
+            prevoutSingle = txTo.vin[nIn].prevout;
+
+        uint256 hashSequence;
+        uint32_t sequenceSingle = 0xffffffff;
+        if (!(nHashType & 0xc))
+            hashSequence = cache ? cache->hashSequence : GetSequenceHash(txTo);
+        else if ((nHashType & 0xc) == SIGHASH_MSV0_SINGLESEQUENCE)
+            sequenceSingle = txTo.vin[nIn].nSequence;
+
+        CAmount nAmount = ((nHashType & 3) == SIGHASH_MSV0_NOINPUT_NOVALUE) ? -1 : amount;
+
+        uint256 hashOutputs;
+        CAmount outputSingleValue = -1;
+        CScript outputSingleScript;
+        if (!(nHashType & 0x30))
+            hashOutputs = cache ? cache->hashOutputs : GetOutputsHash(txTo);
+        else if ((nHashType & 0x30) != SIGHASH_MSV0_NOOUTPUT) {
+            assert(nIn < txTo.vout.size());
+            outputSingleScript = txTo.vout[nIn].scriptPubKey;
+            if ((nHashType & 0x30) == SIGHASH_MSV0_SINGLEOUTPUT)
+                outputSingleValue = txTo.vout[nIn].nValue;
+        }
+
+        CAmount nFees = (nHashType & SIGHASH_MSV0_NOFEE) ? -1 : nFeesIn;
+        uint32_t nLockTime = (nHashType & SIGHASH_MSV0_NOLOCKTIME) ? 0xffffffff : txTo.nLockTime;
+
+        CHashWriter ss(SER_GETHASH, 0);
+        ss << nVersion << nInputIndex << hashPrevouts << prevoutSingle << hashSequence << sequenceSingle << nAmount ;
+        ss << hashOutputs << outputSingleValue << static_cast<const CScriptBase&>(outputSingleScript) << nFees << nLockTime;
+
+        if (nHashType & SIGHASH_MSV0_NOSCRIPTCODE)
+            ss << CScriptBase();
+        else
+            ss << static_cast<const CScriptBase&>(scriptCode);
+
+        assert (vscriptSigCode.size() == MAX_MSV0_SCRIPTSIGCODE);
+        for (unsigned int i = 0; i < MAX_MSV0_SCRIPTSIGCODE; i++) {
+            if (nHashType & (1U << (11 + i)))
+                ss << CScriptBase();
+            else
+                ss << static_cast<const CScriptBase&>(vscriptSigCode[i]);
+        }
+
+        // nSigVersion is 0x01000000 (witness v1) + 0 (MSV0)
+        // Each future version should have its unique nSigVersion > 255 to avoid collision with legacy signatures
+        const unsigned int nSigVersion = 0x01000000;
+        ss << nHashType << nSigVersion;
+
+        return ss.GetHash();
+    }
     if (sigversion == SIGVERSION_WITNESS_V0) {
         uint256 hashPrevouts;
         uint256 hashSequence;
@@ -1596,27 +1723,37 @@ uint256 SignatureHash(const CScript& scriptCode, const CTransaction& txTo, unsig
     return ss.GetHash();
 }
 
-bool TransactionSignatureChecker::VerifySignature(const std::vector<unsigned char>& vchSig, const CPubKey& pubkey, const uint256& sighash) const
+bool TransactionSignatureChecker::VerifySignature(const std::vector<unsigned char>& vchSig, const CPubKey& pubkey, const uint256& sighash, const bool& compact) const
 {
-    return pubkey.Verify(sighash, vchSig);
+    return pubkey.Verify(sighash, vchSig, compact);
 }
 
-bool TransactionSignatureChecker::CheckSig(const vector<unsigned char>& vchSigIn, const vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const
+bool TransactionSignatureChecker::CheckSig(const vector<unsigned char>& vchSigIn, const vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion, const std::vector<CScript>& vscriptSigCode) const
 {
     CPubKey pubkey(vchPubKey);
+    bool compact = false;
     if (!pubkey.IsValid())
         return false;
 
-    // Hash type is one byte tacked on to the end of the signature
+    uint32_t nHashType = 0;
     vector<unsigned char> vchSig(vchSigIn);
     if (vchSig.empty())
         return false;
-    int nHashType = vchSig.back();
-    vchSig.pop_back();
+    if (sigversion == SIGVERSION_BASE || sigversion == SIGVERSION_WITNESS_V0) {
+        // Hash type is one byte tacked on to the end of the signature
+        nHashType = vchSig.back();
+        vchSig.pop_back();
+    }
+    else {
+        compact = true;
+        nHashType = GetCompactHashType(vchSig);
+        if (((nHashType & 0x30) == SIGHASH_MSV0_SINGLEOUTPUT || (nHashType & 0x30) == SIGHASH_MSV0_SINGLEOUTPUT_NOVALUE) && nIn >= txTo->vout.size())
+            return false;
+    }
 
-    uint256 sighash = SignatureHash(scriptCode, *txTo, nIn, nHashType, amount, nFees, sigversion, this->txdata);
+    uint256 sighash = SignatureHash(scriptCode, vscriptSigCode, *txTo, nIn, nHashType, amount, nFees, sigversion, this->txdata);
 
-    if (!VerifySignature(vchSig, pubkey, sighash))
+    if (!VerifySignature(vchSig, pubkey, sighash, compact))
         return false;
 
     return true;
@@ -1845,6 +1982,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
 
             // Check script size and evaluate scripts
             size_t nTotalScriptSize = 0;
+            unsigned int fUncoveredScriptSigCode = 0;
             int nOpCount = 0;
             for (size_t i = 0; i < MAX_MSV0_SCRIPTSIGCODE; i++) {
                 const CScript& scriptSigCode = vscriptSigCode[MAX_MSV0_SCRIPTSIGCODE - i - 1];
@@ -1852,7 +1990,8 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                     nTotalScriptSize += scriptSigCode.size();
                     if (nTotalScriptSize > MAX_SCRIPT_SIZE)
                         return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
-                    if (!EvalScript(stack, scriptSigCode, flags, checker, SIGVERSION_MSV0, nOpCount, serror))
+                    fUncoveredScriptSigCode |= (1U << (MAX_MSV0_SCRIPTSIGCODE - i - 1));
+                    if (!EvalScript(stack, scriptSigCode, flags, checker, SIGVERSION_MSV0, nOpCount, vscriptSigCode, i, fUncoveredScriptSigCode, serror))
                         return false;
                 }
             }
@@ -1862,9 +2001,12 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                 return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
 
             CScript scriptKeyCode = CScript(vchKeyCode.begin() + 1, vchKeyCode.end());
-            if (!EvalScript(stack, scriptKeyCode, flags, checker, SIGVERSION_MSV0, nOpCount, serror))
+            if (!EvalScript(stack, scriptKeyCode, flags, checker, SIGVERSION_MSV0, nOpCount, vscriptSigCode, MAX_MSV0_SCRIPTSIGCODE, fUncoveredScriptSigCode, serror))
                 return false;
 
+            // All non-empty scriptSigCode must be directly or indirectly covered by at least one signature operation in scriptKeyCode
+            if (fUncoveredScriptSigCode)
+                return set_error(serror, SCRIPT_ERR_UNCOVERED_SCRIPTSIGCODE);
             if (stack.size() != 1)
                 return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
             if (!CastToBool(stack.back()))

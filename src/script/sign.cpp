@@ -23,6 +23,8 @@ TransactionSignatureCreator::TransactionSignatureCreator(const CKeyStore* keysto
 bool TransactionSignatureCreator::CreateSig(std::vector<unsigned char>& vchSig, const CKeyID& address, const CScript& scriptCode, SigVersion sigversion) const
 {
     CKey key;
+    CPubKey pubkey;
+    std::vector<CScript> vscriptSigCode;
     if (!keystore->GetKey(address, key))
         return false;
 
@@ -30,7 +32,7 @@ bool TransactionSignatureCreator::CreateSig(std::vector<unsigned char>& vchSig, 
     if (sigversion == SIGVERSION_WITNESS_V0 && !key.IsCompressed())
         return false;
 
-    uint256 hash = SignatureHash(scriptCode, *txTo, nIn, nHashType, amount, nFees, sigversion);
+    uint256 hash = SignatureHash(scriptCode, vscriptSigCode, *txTo, nIn, nHashType, amount, nFees, sigversion);
     if (!key.Sign(hash, vchSig))
         return false;
     vchSig.push_back((unsigned char)nHashType);
@@ -251,6 +253,7 @@ static vector<valtype> CombineMultisig(const CScript& scriptPubKey, const BaseSi
     unsigned int nSigsRequired = vSolutions.front()[0];
     unsigned int nPubKeys = vSolutions.size()-2;
     map<valtype, valtype> sigs;
+    std::vector<CScript> vscriptSigCode;
     BOOST_FOREACH(const valtype& sig, allsigs)
     {
         for (unsigned int i = 0; i < nPubKeys; i++)
@@ -259,7 +262,7 @@ static vector<valtype> CombineMultisig(const CScript& scriptPubKey, const BaseSi
             if (sigs.count(pubkey))
                 continue; // Already got a sig for this pubkey
 
-            if (checker.CheckSig(sig, pubkey, scriptPubKey, sigversion))
+            if (checker.CheckSig(sig, pubkey, scriptPubKey, sigversion, vscriptSigCode))
             {
                 sigs[pubkey] = sig;
                 break;
@@ -397,7 +400,7 @@ class DummySignatureChecker : public BaseSignatureChecker
 public:
     DummySignatureChecker() {}
 
-    bool CheckSig(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const
+    bool CheckSig(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion, const std::vector<CScript>& vscriptSigCode) const
     {
         return true;
     }
