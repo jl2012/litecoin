@@ -62,8 +62,10 @@ isminetype IsMine(const CKeyStore &keystore, const CScript& scriptPubKey, bool& 
     {
     case TX_NONSTANDARD:
     case TX_NULL_DATA:
+    case TX_WITNESS_V1_MSHASH:
         break;
     case TX_PUBKEY:
+    case TX_WITNESS_V1_PUBKEY_V0:
         keyID = CPubKey(vSolutions[0]).GetID();
         if (sigversion != SIGVERSION_BASE && vSolutions[0].size() != 33) {
             isInvalid = true;

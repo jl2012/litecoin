@@ -12,6 +12,7 @@
 #include "pubkey.h"
 #include "script/script.h"
 #include "uint256.h"
+#include "consensus/merkle.h"
 
 using namespace std;
 
@@ -247,6 +248,12 @@ bool static CheckMinimalPush(const valtype& data, opcodetype opcode) {
 
 bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror)
 {
+    int nOpCount = 0;
+    return EvalScript(stack, script, flags, checker, sigversion, nOpCount, serror);
+}
+
+bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, int& nOpCount, ScriptError* serror)
+{
     static const CScriptNum bnZero(0);
     static const CScriptNum bnOne(1);
     static const CScriptNum bnFalse(0);
@@ -265,7 +272,6 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
     set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
     if (script.size() > MAX_SCRIPT_SIZE)
         return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
-    int nOpCount = 0;
     bool fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA) != 0;
 
     try
@@ -1353,6 +1359,79 @@ bool TransactionSignatureChecker::CheckSequence(const CScriptNum& nSequence) con
     return true;
 }
 
+bool IsMSStack(std::vector<uint256>& vPath, uint32_t& nPosition, std::vector<std::vector<unsigned char> >& stack, std::vector<unsigned char>& vchKeyCode)
+{
+    if (stack.size() < 3)
+        return false;
+
+    // The last stack item is script version and script. The minimum valid size is 33 bytes. Since public key size is
+    // 33 bytes, any scripts smaller than this are not safe. A minimum size is needed because an attacker may try to
+    // execute a 32-byte intermediate hash as a script.
+    vchKeyCode = stack.back();
+    if (vchKeyCode.size() < 33)
+        return false;
+    stack.pop_back();
+
+    // The second last stack item is the path. Size must be 0 to 1024, and divisible by 32
+    // Depth of the Merkle tree is implied by the size of path (0 to 32)
+    if (stack.back().size() & 0x1f || stack.back().size() > 1024)
+        return false;
+    const size_t depth = stack.back().size() >> 5;
+    // Path is a vector of 32-byte hashes
+    vPath.resize(depth);
+    for (unsigned int j = 0; j < depth; j++)
+        memcpy(vPath[j].begin(), &stack.back()[32 * j], 32);
+    stack.pop_back();
+
+    // The third last item encodes the position (as CScriptNum). It must be minimally encoded
+    try
+    {
+        const CScriptNum pos(stack.back(), true, 5);
+        if (pos < 0 || pos >= (1ULL << depth))
+            return false;
+        nPosition = pos.getint64();
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    stack.pop_back();
+
+    // Unused stack items become the stack of the following step
+    return true;
+}
+
+bool IsMSV0Stack(std::vector<std::vector<unsigned char> >& stack, std::vector<CScript>& vscriptSigCode)
+{
+    if (stack.size() < 1)
+        return false;
+
+    // The last item is number of scriptSigCode (0 to 5). It must be minimally encoded
+    unsigned char nSigScriptCode = 0;
+    if (stack.back().size() > 0) {
+        nSigScriptCode = stack.back().at(0);
+        if (nSigScriptCode == 0 || nSigScriptCode > MAX_MSV0_SCRIPTSIGCODE || stack.back().size() > 1)
+            return false;
+    }
+    stack.pop_back();
+
+    if (stack.size() < nSigScriptCode)
+        return false;
+    vscriptSigCode.clear();
+    vscriptSigCode.resize(MAX_MSV0_SCRIPTSIGCODE);
+    for (size_t i = 0; i < nSigScriptCode; i++) {
+        // The first defined scriptSigCode must not be empty or that becomes malleable.
+        if (i == (nSigScriptCode - 1) && stack.back().size() == 0)
+            return false;
+        vscriptSigCode.at(i) = CScript(stack.back().begin(), stack.back().end());
+        stack.pop_back();
+    }
+
+    // Unused stack items become the stack for script evaluation
+    return true;
+}
+
 static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror)
 {
     vector<vector<unsigned char> > stack;
@@ -1381,6 +1460,74 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         } else {
             return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH);
         }
+    } else if (witversion == 1 && program.size() >= 32 && (flags & SCRIPT_VERIFY_MSV0)) {
+        std::vector<unsigned char> vchKeyCode;
+        stack = witness.stack;
+        if (program.size() == 32) {
+            uint256 hashScript;
+            std::vector<uint256> vPath;
+            uint32_t nPosition;
+
+            if (!IsMSStack(vPath, nPosition, stack, vchKeyCode))
+                return set_error(serror, SCRIPT_ERR_INVALID_MS_STACK);
+
+            // Calculate the script hash.
+            CSHA256().Write(&vchKeyCode[0], vchKeyCode.size()).Finalize(hashScript.begin());
+
+            // Calculate MAST Root and compare against witness program
+            uint256 hashScriptRoot = ComputeMerkleRootFromBranch(hashScript, vPath, nPosition);
+            if (memcmp(hashScriptRoot.begin(), &program[0], 32))
+                return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
+        }
+        else if (program.size() == 33) {
+            vchKeyCode.resize(36);
+            vchKeyCode[0] = 0;
+            vchKeyCode[1] = 0x21;
+            memcpy(&vchKeyCode[2], &program[0], 33);
+            vchKeyCode[35] = OP_CHECKSIG;
+        }
+
+        if (vchKeyCode.size() > 0 && vchKeyCode[0] == 0) {
+            std::vector<CScript> vscriptSigCode;
+            if (!IsMSV0Stack(stack, vscriptSigCode))
+                return set_error(serror, SCRIPT_ERR_INVALID_MS_STACK);
+
+            // Check the size of input stack
+            for (unsigned int i = 0; i < stack.size(); i++) {
+                if (stack.at(i).size() > MAX_SCRIPT_ELEMENT_SIZE)
+                    return set_error(serror, SCRIPT_ERR_PUSH_SIZE);
+            }
+
+            // Check script size and evaluate scripts
+            size_t nTotalScriptSize = 0;
+            int nOpCount = 0;
+            for (size_t i = 0; i < MAX_MSV0_SCRIPTSIGCODE; i++) {
+                const CScript& scriptSigCode = vscriptSigCode[MAX_MSV0_SCRIPTSIGCODE - i - 1];
+                if (scriptSigCode.size() > 0) {
+                    nTotalScriptSize += scriptSigCode.size();
+                    if (nTotalScriptSize > MAX_SCRIPT_SIZE)
+                        return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
+                    if (!EvalScript(stack, scriptSigCode, flags, checker, SIGVERSION_MSV0, nOpCount, serror))
+                        return false;
+                }
+            }
+
+            nTotalScriptSize += (vchKeyCode.size() - 1);
+            if (nTotalScriptSize > MAX_SCRIPT_SIZE)
+                return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
+
+            CScript scriptKeyCode = CScript(vchKeyCode.begin() + 1, vchKeyCode.end());
+            if (!EvalScript(stack, scriptKeyCode, flags, checker, SIGVERSION_MSV0, nOpCount, serror))
+                return false;
+
+            if (stack.size() != 1)
+                return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
+            if (!CastToBool(stack.back()))
+                return set_error(serror, SCRIPT_ERR_EVAL_FALSE);
+        }
+        else if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM)
+            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
+        return set_success(serror);
     } else if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {
         return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
     } else {
