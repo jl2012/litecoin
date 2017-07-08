@@ -1103,6 +1103,92 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, un
                 }
                 break;
 
+                case OP_MUL:
+                {
+                    if (stack.size() < 2)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    CScriptNum bn1(stacktop(-2), fRequireMinimal, 7);
+                    CScriptNum bn2(stacktop(-1), fRequireMinimal, 7);
+
+                    popstack(stack);
+                    popstack(stack);
+                    if (bn1 == bnZero || bn2 == bnZero) {
+                        stack.push_back(vchZero);
+                        break;
+                    }
+
+                    bool negative = false;
+                    if (bn1 < bnZero) {
+                        negative = true;
+                        bn1 = -bn1;
+                    }
+                    if (bn2 < bnZero) {
+                        negative = !negative;
+                        bn2 = -bn2;
+                    }
+
+                    uint64_t n1 = bn1.getint64();
+                    uint64_t n2 = bn2.getint64();
+                    const uint64_t mul = n1 * n2;
+                    if (mul / n1 != n2 || mul >= (1ULL << 55))
+                        return set_error(serror, SCRIPT_ERR_NUM_PUSH_SIZE);
+                    CScriptNum bnRet(mul);
+
+                    if (negative)
+                        bnRet = -bnRet;
+
+                    stack.push_back(bnRet.getvch());
+                }
+                break;
+
+                case OP_2DIV:
+                case OP_DIV:
+                case OP_MOD:
+                {
+                    if (opcode == OP_2DIV) {
+                        CScriptNum bnTwo(2);
+                        stack.push_back(bnTwo.getvch());
+                    }
+                    if (stack.size() < 2)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    CScriptNum bn1(stacktop(-2), fRequireMinimal, 7);
+                    CScriptNum bn2(stacktop(-1), fRequireMinimal, 7);
+                    bool negativediv = false;
+                    bool negativemod = false;
+
+                    if (bn2 == bnZero)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    if (bn1 < bnZero) {
+                        negativediv = true;
+                        negativemod = true;
+                        bn1 = -bn1;
+                    }
+                    if (bn2 < bnZero) {
+                        negativediv = !negativediv;
+                        bn2 = -bn2;
+                    }
+
+                    const uint64_t n1 = bn1.getint64();
+                    const uint64_t n2 = bn2.getint64();
+
+                    CScriptNum bnRet(0);
+                    if (opcode == OP_MOD) {
+                        bnRet = n1 % n2;
+                        if (negativemod)
+                            bnRet = -bnRet;
+                    }
+                    else {
+                        bnRet = n1 / n2;
+                        if (negativediv)
+                            bnRet = -bnRet;
+                    }
+                    popstack(stack);
+                    popstack(stack);
+                    stack.push_back(bnRet.getvch());
+                }
+                break;
 
                 //
                 // Crypto
