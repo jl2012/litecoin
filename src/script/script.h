@@ -183,6 +183,7 @@ enum opcodetype
     // MSV0
     OP_CHECKSIGFROMSTACK = 0xc1,
     OP_CHECKSIGFROMSTACKVERIFY = 0xc2,
+    OP_PUSHTXDATA = 0xd0,
 
     // template matching params
     OP_SMALLINTEGER = 0xfa,
